@@ -48,7 +48,7 @@ const upload = multer({
 app.use(helmet());
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
-    ? ['https://your-flutter-app-domain.com'] // Replace with your Flutter app domain
+    ? ['https://macromateapi.onrender.com'] // Replace with your Flutter app domain
     : ['http://localhost:3000', 'http://localhost:8080', 'http://10.0.2.2:3000'], // Local development
   credentials: true
 }));
