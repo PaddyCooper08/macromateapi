@@ -36,9 +36,29 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
+    console.log('File filter - checking file:', {
+      originalname: file.originalname,
+      mimetype: file.mimetype,
+      fieldname: file.fieldname
+    });
+    
+    // Be more permissive - accept all files and validate in the endpoint
+    // This helps avoid issues with mobile apps sending files with incorrect MIME types
+    if (!file.mimetype || file.mimetype === 'application/octet-stream') {
+      console.log('File has no/generic MIME type, checking extension');
+      const hasImageExtension = /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(file.originalname || '');
+      if (hasImageExtension) {
+        console.log('File accepted based on extension');
+        cb(null, true);
+      } else {
+        console.log('File rejected - no image extension');
+        cb(new Error('Only image files are allowed'), false);
+      }
+    } else if (file.mimetype.startsWith('image/')) {
+      console.log('File accepted as image by MIME type');
       cb(null, true);
     } else {
+      console.log('File rejected - not an image MIME type');
       cb(new Error('Only image files are allowed'), false);
     }
   }
@@ -48,7 +68,14 @@ const upload = multer({
 app.use(helmet());
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
-    ? ['https://your-flutter-app-domain.com'] // Replace with your Flutter app domain
+    ? [
+        'https://macromateapi.onrender.com', // Your production server
+        'http://localhost:3000', // Allow local Flutter web development
+        'http://10.0.2.2:3000', // Android emulator
+        'capacitor://localhost', // Capacitor apps
+        'ionic://localhost', // Ionic apps
+        '*' // Allow all origins for mobile apps (since they don't have a fixed origin)
+      ]
     : ['http://localhost:3000', 'http://localhost:8080', 'http://10.0.2.2:3000'], // Local development
   credentials: true
 }));
@@ -152,16 +179,46 @@ app.post('/api/calculate-macros', async (req, res) => {
 // Calculate macros from image
 app.post('/api/calculate-image-macros', upload.single('image'), async (req, res) => {
   try {
+    console.log('Received image upload request');
+    console.log('Request body:', { weight: req.body.weight, userId: req.body.userId });
+    console.log('File info:', req.file ? { 
+      mimetype: req.file.mimetype, 
+      size: req.file.size,
+      filename: req.file.originalname 
+    } : 'No file');
+
     const { weight, userId } = req.body;
 
     if (!req.file || !userId) {
+      console.log('Missing required fields:', { hasFile: !!req.file, userId });
       return res.status(400).json({
         success: false,
         error: 'Missing required fields: image file and userId'
       });
     }
 
+    // Additional file validation
     const imageBuffer = req.file.buffer;
+    console.log('Image buffer size:', imageBuffer.length);
+    
+    // Check if the file is actually an image by examining the buffer
+    const isValidImage = imageBuffer.length > 0 && (
+      // Check for common image file signatures
+      imageBuffer[0] === 0xFF && imageBuffer[1] === 0xD8 || // JPEG
+      imageBuffer[0] === 0x89 && imageBuffer[1] === 0x50 || // PNG
+      imageBuffer[0] === 0x47 && imageBuffer[1] === 0x49 || // GIF
+      imageBuffer[0] === 0x42 && imageBuffer[1] === 0x4D    // BMP
+    );
+    
+    if (!isValidImage && req.file.mimetype && !req.file.mimetype.startsWith('image/')) {
+      console.log('File validation failed - not a valid image file');
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid file type',
+        message: 'Please upload a valid image file (JPG, PNG, GIF, BMP)'
+      });
+    }
+
     const prompt = `You are a nutrition expert. Analyze the following image of a food nutrition label and then calculate the macronutrients for the weight specified in the prompt.
 
 IMPORTANT: Respond ONLY with a valid JSON object in the exact format specified below. Do not include any additional text, markdown formatting, or explanations.
@@ -196,8 +253,10 @@ Now analyze the image with weight: "${weight || ''}"`;
       { text: prompt },
     ];
 
+    console.log('Calling Gemini API with image...');
     // Calculate macros using Gemini
     const macroData = await calculateImageMacros(contents);
+    console.log('Gemini response:', macroData);
 
     // Check if macros were successfully calculated
     if (
@@ -205,6 +264,7 @@ Now analyze the image with weight: "${weight || ''}"`;
       macroData.carbs_g === 0 &&
       macroData.fats_g === 0
     ) {
+      console.log('Zero macros detected, returning error');
       return res.status(400).json({
         success: false,
         error: 'Could not calculate macros from image',
@@ -213,6 +273,7 @@ Now analyze the image with weight: "${weight || ''}"`;
       });
     }
 
+    console.log('Saving macro data to database...');
     // Save to database
     const now = new Date();
     const date = now.toISOString().split("T")[0]; // YYYY-MM-DD
@@ -229,6 +290,8 @@ Now analyze the image with weight: "${weight || ''}"`;
       macroData.calories
     );
 
+    console.log('Successfully saved to database:', savedData.id);
+
     res.json({
       success: true,
       data: {
@@ -240,6 +303,7 @@ Now analyze the image with weight: "${weight || ''}"`;
     });
   } catch (error) {
     console.error('Error processing image macros:', error);
+    console.error('Error stack:', error.stack);
     res.status(500).json({
       success: false,
       error: 'Failed to process image',
@@ -582,6 +646,12 @@ app.delete('/api/favorites/:userId/:favoriteId', async (req, res) => {
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
+  console.error('Error details:', {
+    name: error.name,
+    message: error.message,
+    code: error.code,
+    stack: error.stack
+  });
   
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
@@ -591,6 +661,15 @@ app.use((error, req, res, next) => {
         message: 'Image file must be smaller than 10MB'
       });
     }
+  }
+  
+  // Handle file filter errors
+  if (error.message === 'Only image files are allowed') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid file type',
+      message: 'Please upload a valid image file (JPG, PNG, GIF, etc.)'
+    });
   }
   
   res.status(500).json({
